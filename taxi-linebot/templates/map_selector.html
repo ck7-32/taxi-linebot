@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>選擇目的地</title>
+    <style>
+        #map {
+            height: 80vh;
+            width: 100%;
+        }
+        .button-container {
+            padding: 10px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div class="button-container">
+        <button id="confirm-btn" disabled>確認選擇</button>
+    </div>
+
+    <script>
+        let map;
+        let marker;
+        const API_KEY = '{{ config.GOOGLE_MAPS_API_KEY }}';
+
+        function initMap() {
+            map = new google.maps.Map(document.getElementById('map'), {
+                center: {lat: 25.0330, lng: 121.5654},
+                zoom: 13
+            });
+
+            map.addListener('click', (e) => {
+                if (marker) {
+                    marker.setMap(null);
+                }
+                marker = new google.maps.Marker({
+                    position: e.latLng,
+                    map: map
+                });
+                document.getElementById('confirm-btn').disabled = false;
+            });
+
+            document.getElementById('confirm-btn').addEventListener('click', () => {
+                if (marker) {
+                    const lat = marker.getPosition().lat();
+                    const lng = marker.getPosition().lng();
+                    
+                    // 發送座標到後端
+                    fetch('/api/set_destination', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            userId: new URLSearchParams(window.location.search).get('userId'),
+                            lat: lat,
+                            lng: lng
+                        })
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.status === 'success') {
+                            window.close(); // 關閉LIFF視窗
+                        }
+                    });
+                }
+            });
+        }
+    </script>
+    <script async defer
+        src="https://maps.googleapis.com/maps/api/js?key={{ config.GOOGLE_MAPS_API_KEY }}&callback=initMap">
+    </script>
+</body>
+</html>

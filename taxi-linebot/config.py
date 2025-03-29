@@ -16,3 +16,13 @@ class Config:
     # Application
     DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
     SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-here')
+    
+    # Registration
+    PASSWORD_SALT = os.getenv('PASSWORD_SALT', 'your-password-salt-here')
+    EMAIL_VERIFICATION_EXPIRE = int(os.getenv('EMAIL_VERIFICATION_EXPIRE', '3600'))  # 1 hour
+    
+    # Email Configuration
+    SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+    SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
+    EMAIL_ADDRESS = os.getenv('EMAIL_ADDRESS')
+    EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD')
