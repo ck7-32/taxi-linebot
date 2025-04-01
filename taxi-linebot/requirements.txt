@@ -1,4 +1,7 @@
+# --- requirements.txt ---
 Flask==2.3.2
 pymongo==4.5.0
 line-bot-sdk==3.0.0
 python-dotenv==1.0.0
+requests # <-- Make sure this is present
+APScheduler==3.10.4

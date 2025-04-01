@@ -1,281 +1,152 @@
-from flask import Flask, request, abort
+# --- app.py ---
+# -*- coding: utf-8 -*-
+import os
+import logging
+import atexit
+
+from flask import Flask, current_app
+from pymongo import MongoClient, GEOSPHERE
+from apscheduler.schedulers.background import BackgroundScheduler
 from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import (
-    MessageEvent, 
-    TextMessage, 
-    LocationMessage,
-    TextSendMessage,
-    TemplateSendMessage,
-    ButtonsTemplate,
-    PostbackAction,
-    PostbackEvent,
-    URIAction,
-    MessageAction
-)
+
 from config import Config
-from models import User
-import requests
 
-app = Flask(__name__)
-app.config.from_object(Config)
+# --- Globals for simplified access ---
+# These will be initialized in create_app
+db = None
+line_bot_api = None
+handler = None # WebhookHandler needs to be accessible by webhook_handlers
+scheduler = None
 
-line_bot_api = LineBotApi(app.config['LINE_CHANNEL_ACCESS_TOKEN'])
-handler = WebhookHandler(app.config['LINE_CHANNEL_SECRET'])
+# --- Application Factory ---
+def create_app(config_class=Config):
+    global db, line_bot_api, handler, scheduler
 
-# 用於追蹤用戶狀態
-registration_states = {}
-setting_states = {}
+    app = Flask(__name__)
+    app.config.from_object(config_class)
 
-@app.route("/", methods=['POST'])
-@app.route("/callback", methods=['POST'])
-def callback():
-    # 取得請求標頭中的X-Line-Signature
-    signature = request.headers['X-Line-Signature']
+    # Setup Logging
+    log_level = logging.DEBUG if app.config['DEBUG'] else logging.INFO
+    logging.basicConfig(level=log_level, format='%(asctime)s %(levelname)s:%(name)s:%(threadName)s:%(message)s')
+    logging.getLogger('apscheduler.scheduler').setLevel(logging.WARNING) # Quieter scheduler logs
 
-    # 取得請求主體
-    body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
+    app.logger.info("Flask App Initializing...")
 
-    # 驗證簽章
+    # Check Config
     try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
+        config_class.check_essential_configs()
+    except ValueError as e:
+        app.logger.critical(f"Configuration Error: {e}")
+        exit(1)
 
-    return 'OK'
+    # Initialize MongoDB
+    try:
+        client = MongoClient(app.config['MONGO_URI'])
+        client.server_info() # Verify connection
+        db = client[app.config['MONGO_DB_NAME']]
+        app.logger.info(f"Connected to MongoDB: {app.config['MONGO_DB_NAME']}")
+        initialize_database(db, app.logger)
+    except Exception as e:
+        app.logger.critical(f"Failed to connect to MongoDB: {e}")
+        db = None # Important to keep it None if failed
 
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    user_id = event.source.user_id
-    user = User.find_by_line_user_id(user_id)
-    
-    if not user:
-        # 處理註冊流程
-        if user_id in registration_states:
-            step = registration_states[user_id]['step']
-            
-            if step == 'name':
-                # 儲存姓名並要求電話
-                registration_states[user_id]['name'] = event.message.text
-                registration_states[user_id]['step'] = 'phone'
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text='請輸入您的電話號碼：')
-                )
-            elif step == 'phone':
-                # 完成註冊
-                name = registration_states[user_id]['name']
-                phone = event.message.text
-                
-                # 建立新用戶
-                new_user = User(
-                    line_user_id=user_id,
-                    name=name,
-                    phone=phone
-                )
-                new_user.save()
-                
-                # 清除註冊狀態
-                del registration_states[user_id]
-                
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=f'註冊成功！歡迎使用共乘計程車服務，{name}。')
-                )
+    # Initialize Line Bot API & Handler
+    try:
+        if app.config['LINE_CHANNEL_ACCESS_TOKEN'] and app.config['LINE_CHANNEL_SECRET']:
+            line_bot_api = LineBotApi(app.config['LINE_CHANNEL_ACCESS_TOKEN'])
+            handler = WebhookHandler(app.config['LINE_CHANNEL_SECRET'])
+            app.logger.info("Line Bot API and Handler Initialized.")
         else:
-            # 新用戶註冊流程
-            line_bot_api.reply_message(
-                event.reply_token,
-                TemplateSendMessage(
-                    alt_text='註冊表單',
-                    template=ButtonsTemplate(
-                        title='歡迎使用共乘計程車服務',
-                        text='請先完成註冊',
-                        actions=[
-                            PostbackAction(
-                                label='開始註冊',
-                                data='action=register'
-                            )
-                        ]
-                    )
-                )
-            )
+             app.logger.critical("LINE secrets not found in config.")
+             line_bot_api = None
+             handler = None
+    except Exception as e:
+        app.logger.critical(f"Failed to initialize Line Bot API/Handler: {e}")
+        line_bot_api = None
+        handler = None
+
+    # Import and Register Blueprints AFTER globals are set
+    from webhook_handlers import webhook_bp
+    app.register_blueprint(webhook_bp)
+    app.logger.info("Webhook Blueprint registered.")
+
+    # Initialize and Start Scheduler
+    from matching_logic import process_pending_matches # Import the job function
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(
+        func=lambda: run_scheduled_job(app, process_pending_matches),
+        trigger="interval",
+        minutes=app.config['MATCH_INTERVAL_MINUTES'],
+        id="process_matches_job",
+        replace_existing=True
+    )
+    # Only start scheduler if DB and API seem okay? Or let it run and log errors? Let it run for now.
+    if db is not None and line_bot_api is not None:
+         scheduler.start()
+         app.logger.info(f"Scheduler started. Running 'process_matches' every {app.config['MATCH_INTERVAL_MINUTES']} minute(s).")
     else:
-        # 處理設定流程
-        if user_id in setting_states:
-            step = setting_states[user_id]['step']
-            
-            if step == 'destination':
-                # 儲存目的地並要求人數
-                setting_states[user_id]['destination'] = event.message.text
-                setting_states[user_id]['step'] = 'passengers'
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text='請輸入乘車人數（1-4人）：')
-                )
-            elif step == 'passengers':
-                # 完成設定
-                try:
-                    passengers = int(event.message.text)
-                    if passengers < 1 or passengers > 4:
-                        raise ValueError
-                    
-                    # 更新用戶資料
-                    user['destination'] = setting_states[user_id]['destination']
-                    user['passengers'] = passengers
-                    db.users.update_one(
-                        {'line_user_id': user_id},
-                        {'$set': {
-                            'destination': user['destination'],
-                            'passengers': user['passengers']
-                        }}
-                    )
-                    
-                    # 清除設定狀態
-                    del setting_states[user_id]
-                    
-                    line_bot_api.reply_message(
-                        event.reply_token,
-                        [
-                            TextSendMessage(text=f'✓ 設定完成！\n目的地：{user["destination"]}\n人數：{user["passengers"]}人'),
-                            TextSendMessage(text='⏳ 正在為您尋找共乘夥伴...\n配對成功將立即通知您！')
-                        ]
-                    )
-                except ValueError:
-                    line_bot_api.reply_message(
-                        event.reply_token,
-                        TextSendMessage(text='人數輸入無效，請輸入1到4之間的數字。')
-                    )
-        else:
-            # 已註冊用戶處理
-            line_bot_api.reply_message(
-                event.reply_token,
-                TemplateSendMessage(
-                    alt_text='主選單',
-                    template=ButtonsTemplate(
-                        title='共乘計程車服務',
-                        text='請選擇功能',
-                        actions=[
-                            PostbackAction(
-                                label='設定目的地',
-                                data='action=set_destination'
-                            ),
-                            PostbackAction(
-                                label='開始配對',
-                                data='action=start_matching'
-                            )
-                        ]
-                    )
-                )
-            )
+        app.logger.warning("Scheduler NOT started due to DB or Line API initialization issues.")
 
-@handler.add(PostbackEvent)
-def handle_postback(event):
-    user_id = event.source.user_id
-    data = event.postback.data
-    
-    if data == 'action=register':
-        # 開始註冊流程
-        registration_states[user_id] = {'step': 'name'}
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text='請輸入您的姓名：')
-        )
-    elif data == 'action=set_destination':
-        # 開始設定目的地流程
-        setting_states[user_id] = {'step': 'destination'}
-        line_bot_api.reply_message(
-            event.reply_token,
-            TemplateSendMessage(
-                alt_text='設定目的地方式',
-                template=ButtonsTemplate(
-                    title='設定目的地',
-                    text='請選擇設定方式：',
-                    actions=[
-                        PostbackAction(
-                            label='傳送位置',
-                            data='action=send_location'
-                        ),
-                        PostbackAction(
-                            label='輸入地址',
-                            data='action=enter_address'
-                        )
-                    ]
-                )
-            )
-        )
-    elif data == 'action=send_location':
-        line_bot_api.reply_message(
-            event.reply_token,
-            TemplateSendMessage(
-                alt_text="請分享您的位置",
-                template=ButtonsTemplate(
-                    text="請點擊下方按鈕來分享您的位置",
-                    actions=[
-                        URIAction(label="分享位置", uri="line://nv/location")
-                    ]
-                )
-            )
-        )
-    elif data == 'action=enter_address':
-        setting_states[user_id] = {'step': 'destination'}
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text='請輸入您的目的地地址：')
-        )
+    # Register scheduler shutdown hook
+    atexit.register(lambda: shutdown_scheduler())
 
-@handler.add(LocationMessage)
-def handle_location_message(event):
-    user_id = event.source.user_id
-    user = User.find_by_line_user_id(user_id)
-    
-    if user and user_id in setting_states:
-        # 從位置訊息取得經緯度
-        latitude = event.message.latitude
-        longitude = event.message.longitude
-        
-        # 使用Geocoding API取得地址
-        maps_api_key = app.config['GOOGLE_MAPS_API_KEY']
-        response = requests.get(
-            f'https://maps.googleapis.com/maps/api/geocode/json?latlng={latitude},{longitude}&key={maps_api_key}'
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data['status'] == 'OK':
-                address = data['results'][0]['formatted_address']
-                
-                # 更新用戶資料庫記錄
-                db.users.update_one(
-                    {'line_user_id': user_id},
-                    {'$set': {
-                        'destination': address,
-                        'location': {
-                            'type': 'Point',
-                            'coordinates': [longitude, latitude]
-                        }
-                    }}
-                )
-                
-                # 進入下一步設定乘車人數
-                setting_states[user_id]['step'] = 'passengers'
-                
-                # 回傳確認訊息並要求輸入人數
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    [
-                        TextSendMessage(text=f"📍 已設定目的地：\n{address}\n🌐 座標：{latitude:.6f}, {longitude:.6f}"),
-                        TextSendMessage(text="請輸入乘車人數（1-4人）：")
-                    ]
-                )
-                return
-        
-        # 處理API錯誤情況
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="無法取得地址資訊，請稍後再試或改用文字輸入")
-        )
+    # Basic root route for health check
+    @app.route('/')
+    def index():
+        return "Taxi Line Bot Service (Simplified) is Running!"
 
-if __name__ == "__main__":
-    app.run(debug=app.config['DEBUG'])
+    return app
+
+# --- Helper Functions ---
+def initialize_database(db_instance, logger):
+    """Creates collections and indexes if they don't exist."""
+    if db_instance is None: return
+    try:
+        collections = db_instance.list_collection_names()
+        if 'users' not in collections:
+            # db_instance.create_collection('users') # Creating is implicit on first insert/index
+            db_instance.users.create_index([("location", GEOSPHERE)], background=True)
+            logger.info("Created Geo index on 'users'.")
+        if 'pending_matches' not in collections:
+            db_instance.pending_matches.create_index([("timestamp", 1)], background=True)
+            logger.info("Created timestamp index on 'pending_matches'.")
+        if 'matches' not in collections:
+            db_instance.matches.create_index([("group_id", 1)], unique=True, background=True)
+            logger.info("Created unique group_id index on 'matches'.")
+        # feedbacks collection will be created on first insert
+    except Exception as e:
+        logger.error(f"Error during database indexing: {e}")
+
+def run_scheduled_job(app_context, job_func):
+    """Wrapper to run scheduled job within Flask app context."""
+    with app_context.app_context():
+        try:
+            # Perform DB check again inside context, just in case
+            if db is None:
+                 current_app.logger.error(f"Scheduled job '{job_func.__name__}' skipped: DB not available.")
+                 return
+            job_func()
+        except Exception as e:
+             current_app.logger.exception(f"Exception in scheduled job '{job_func.__name__}': {e}")
+
+def shutdown_scheduler():
+    """Gracefully shuts down the scheduler."""
+    global scheduler
+    if scheduler and scheduler.running:
+        print("Shutting down scheduler...")
+        try:
+            scheduler.shutdown()
+            print("Scheduler shut down.")
+        except Exception as e:
+            print(f"Error shutting down scheduler: {e}")
+
+# --- Main Execution ---
+if __name__ == '__main__':
+    app = create_app()
+    # Check essential components after creation
+    if db is None or line_bot_api is None or handler is None:
+         app.logger.critical("Application failed to initialize essential components. Exiting.")
+         exit(1)
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=app.config['DEBUG'])
