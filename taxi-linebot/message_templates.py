@@ -12,6 +12,7 @@ STATE_AWAITING_REG_PHONE = 'awaiting_reg_phone'
 STATE_AWAITING_DESTINATION = 'awaiting_destination'
 STATE_AWAITING_PASSENGERS = 'awaiting_passengers'
 STATE_AWAITING_FEEDBACK = 'awaiting_feedback'
+STATE_AWAITING_PLATE = 'awaiting_plate'  # 新增此行
 
 MATCH_STATUS_ACTIVE = 'active'
 MATCH_STATUS_CANCELLED = 'cancelled'
@@ -195,3 +196,30 @@ def create_match_cancelled_message(match_id: str):
 
 def create_member_left_message(match_id: str, leaver_name: str, remaining_count: int):
      return TextSendMessage(text=f"ℹ️ 通知：共乘夥伴「{leaver_name}」已退出隊伍 (ID: {match_id[:8]})。目前隊伍尚有 {remaining_count} 人。")
+
+# 在檔案末尾加入新的模板函數
+def create_leader_match_success(leader_name: str, match_data: dict, members_info: list):
+    """Message sent to the leader."""
+    match_id = match_data['group_id']
+    base_text = f"🎉 配對成功！您是本次共乘的隊長 (ID: {match_id[:8]})。\n\n您的隊員資訊如下：\n"
+    
+    for member in members_info:
+        phone_display = member.get('phone', '未提供')
+        base_text += f"\n- {member.get('name', '未知夥伴')} (電話: {phone_display})"
+
+    return TextSendMessage(text=base_text)
+
+def create_member_match_success(member_name: str, match_data: dict, leader_info: dict):
+    """Message sent to a regular member."""
+    match_id = match_data['group_id']
+    leader_name_display = leader_info.get('name', '未知隊長')
+    leader_phone_display = leader_info.get('phone', '未提供')
+
+    base_text = f"🎉 配對成功！您已加入共乘隊伍 (ID: {match_id[:8]})。\n\n本次隊長資訊：\n- {leader_name_display} (電話: {leader_phone_display})"
+    base_text += "\n\n請等候隊長提供車牌號碼。"
+
+    return TextSendMessage(text=base_text)
+
+def create_license_plate_notification(leader_name: str, license_plate: str):
+    """Message sent to members when leader provides plate."""
+    return TextSendMessage(text=f"🚗 隊長 ({leader_name}) 已提供車牌號碼： {license_plate}\n請準備集合！")

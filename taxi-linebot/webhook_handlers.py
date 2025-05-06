@@ -8,6 +8,7 @@ from linebot.models import (
 )
 from pymongo import ReturnDocument, GEOSPHERE # GEOSPHERE might be needed if re-initializing index here
 from datetime import datetime
+import re  # 新增 re 模組引入
 
 # Import db, line_bot_api, handler from app setup
 from app import db, line_bot_api, handler
@@ -39,7 +40,7 @@ def callback():
         abort(400)
 
     try:
-        handler.handle(body\\, signature)
+        handler.handle(body, signature)
     except InvalidSignatureError:
         logger.error("Invalid signature.")
         abort(400)
@@ -88,9 +89,51 @@ def handle_message(event):
         return
 
     user_data = get_or_create_user(user_id)
-    current_state = user_data.get('state')
-    user_name = user_data.get('name')
+    user_name = user_data.get('name', '朋友')
     is_registered = user_name and user_data.get('phone')
+
+    # 檢查是否為隊長正在等待輸入車牌
+    active_match_as_leader = db.matches.find_one({
+        'leader_id': user_id,
+        'status': message_templates.STATE_AWAITING_PLATE
+    })
+
+    if active_match_as_leader:
+        license_plate = text.upper().replace("-", "").replace(" ", "")
+
+        if re.fullmatch(r"^[A-Z0-9]{2,4}[A-Z0-9]{3,4}$", license_plate):
+            match_id = active_match_as_leader['group_id']
+            members = active_match_as_leader.get('members', [])
+            other_members = [m for m in members if m != user_id]
+
+            # 更新資料庫中的配對記錄
+            db.matches.update_one(
+                {'group_id': match_id},
+                {'$set': {
+                    'license_plate': license_plate,
+                    'status': message_templates.MATCH_STATUS_ACTIVE
+                }}
+            )
+            logger.info(f"Leader {user_id} provided license plate {license_plate} for match {match_id}")
+
+            # 通知隊長成功
+            reply_message_wrapper(reply_token, TextSendMessage(text=f"✅ 車牌號碼 {license_plate} 已登記並通知隊員。"))
+
+            # 通知其他成員
+            leader_name = user_data.get('name', '隊長')
+            plate_message = message_templates.create_license_plate_notification(leader_name, license_plate)
+            if line_bot_api:
+                for member_id in other_members:
+                    try:
+                        line_bot_api.push_message(member_id, plate_message)
+                    except Exception as e:
+                        logger.error(f"Failed to send license plate notification to member {member_id} for match {match_id}: {e}")
+            return
+
+        else:
+            # 格式無效
+            reply_message_wrapper(reply_token, TextSendMessage(text="⚠️ 車牌號碼格式似乎不正確，請重新輸入 (例如 ABC-1234)。"))
+            return
 
     # --- State Machine ---
     if current_state == message_templates.STATE_AWAITING_REG_NAME:
